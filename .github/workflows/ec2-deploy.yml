@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────
+# Pipeline 2: Deploy na instância AWS EC2
+# Roda sozinho quando o Pipeline 1 termina com sucesso
+# ─────────────────────────────────────────────
+name: Deploy EC2
+
+on:
+  workflow_run:
+    workflows: ["Builds and Tests"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  Deploy:
+    name: Implantação AWS
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Deploy via SSH na EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Faz pull da nova imagem
+            sudo docker pull docker.io/mateusggtytyttrt55/senai_fastapi:latest
+
+            # Para e remove o container atual (ignora erro se não existir)
+            sudo docker stop senai_fastapi 2>/dev/null || true
+            sudo docker rm senai_fastapi 2>/dev/null || true
+
+            # Sobe o novo container
+            sudo docker run -d \
+              --name senai_fastapi \
+              --restart unless-stopped \
+              -p 8080:8080 \
+              mateusggtytyttrt55/senai_fastapi:latest
+
+            # Health check pós-deploy
+            sleep 5
+            curl -f http://localhost:8080/health || exit 1
+            echo "✅ Deploy concluído com sucesso!"
+
+            # Remove imagens antigas (economiza espaço em disco)
+            sudo docker image prune -f
