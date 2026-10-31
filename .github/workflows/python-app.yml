@@ -1,0 +1,147 @@
+# ─────────────────────────────────────────────────────────────
+# LAB9 – CI/CD: pipeline único com Homologação e Produção
+#
+#   push → develop → Build → Imagem → HOMOL Deploy (automático, porta 8080)
+#   push → main    → Build → Imagem → ✋ Aprovação → PRD Deploy (porta 80)
+#
+# Substitui os antigos docker-hub.yml e ec2-deploy.yml
+# (o ec2-deploy.yml fazia deploy DIRETO em produção, sem aprovação).
+# ─────────────────────────────────────────────────────────────
+name: CI/CD - Homologação e Produção
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+# ── Variáveis globais (mudou aqui, muda em todos os jobs) ──
+env:
+  IMAGE_NAME: mateusggtytyttrt55/senai_fastapi
+  CONTAINER_PORT: 8080   # porta do uvicorn DENTRO do container (ver Dockerfile)
+
+jobs:
+
+  # ── JOB 1: Build e testes ────────────────────────────────
+  Build:
+    name: Compilar Projeto
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: |
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest httpx  # deps de teste
+
+      - name: Executar testes com pytest
+        run: |
+          PYTHONPATH=. pytest tests/ -v --tb=short
+
+  # ── JOB 2: Imagem no Docker Hub (só em push) ─────────────
+  Imagem:
+    name: Construindo Imagem para Docker
+    runs-on: ubuntu-latest
+    needs: Build
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build e Push Docker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+
+      - name: Resumo da imagem
+        run: |
+          echo "## ✅ Imagem publicada no Docker Hub" >> $GITHUB_STEP_SUMMARY
+          echo "Tags: ${{ github.sha }} e ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+
+  # ── JOB 3: Deploy em HOMOLOGAÇÃO (automático na develop) ─
+  Deploy_Homologacao:
+    name: Deploy Homologação
+    runs-on: ubuntu-latest
+    needs: Imagem
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: homologacao   # secrets EC2_* deste environment = EC2 de homologação
+    steps:
+      - name: Deploy via SSH na EC2 de homologação
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sudo docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            sudo docker stop senai_fastapi_homol 2>/dev/null || true
+            sudo docker rm senai_fastapi_homol 2>/dev/null || true
+            # remove o container dos labs anteriores, que também usava a porta 8080
+            sudo docker rm -f senai_fastapi 2>/dev/null || true
+
+            sudo docker run -d \
+              --name senai_fastapi_homol \
+              --restart unless-stopped \
+              -p 8080:${{ env.CONTAINER_PORT }} \
+              ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            sleep 5
+            curl -f http://localhost:8080/health || exit 1
+            echo "✅ Homologação atualizada!"
+
+            sudo docker image prune -f
+
+  # ── JOB 4: Deploy em PRODUÇÃO (main + aprovação manual) ──
+  Deploy_Producao:
+    name: Deploy Produção
+    runs-on: ubuntu-latest
+    needs: Imagem
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: producao      # tem "Required reviewers" → o job espera aprovação
+    steps:
+      - name: Deploy via SSH na EC2 de produção
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sudo docker pull ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            sudo docker stop senai_fastapi_prd 2>/dev/null || true
+            sudo docker rm senai_fastapi_prd 2>/dev/null || true
+
+            sudo docker run -d \
+              --name senai_fastapi_prd \
+              --restart unless-stopped \
+              -p 80:${{ env.CONTAINER_PORT }} \
+              ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+            sleep 5
+            curl -f http://localhost:80/health || exit 1
+            echo "✅ Produção atualizada!"
+
+            sudo docker image prune -f
